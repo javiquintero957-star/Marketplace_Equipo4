@@ -9,6 +9,8 @@ from typing import Any
 from uuid import UUID, uuid4
 from urllib.parse import urlparse
 
+import httpx
+
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -23,6 +25,7 @@ class Settings(BaseSettings):
     supabase_key: str
     cors_origins: str = "http://localhost:3000"
     payment_webhook_secret: str | None = None
+    catalog_sync_url: str = "https://marketplace-usc-catalogo.onrender.com/api/catalogo/sincronizar"
     environment: str = "development"
     # Ruta absoluta para que Uvicorn encuentre siempre el .env junto a este main.py,
     # incluso si se inicia desde otra carpeta.
@@ -40,6 +43,46 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Payment-Secret"],
 )
 bearer = HTTPBearer(auto_error=False)
+logger = logging.getLogger("uvicorn.error")
+
+
+async def sincronizar_catalogo(producto_id: str, vendedor_id: str) -> dict[str, Any]:
+    """Envía al catálogo la versión persistida del producto; un fallo no revierte Supabase."""
+    try:
+        producto = rows(supabase.table("inv_productos").select(
+            "id, vendedor_id, sku, nombre, precio, stock, imagen_url, inv_categorias(nombre)"
+        ).eq("id", producto_id).eq("vendedor_id", vendedor_id))
+        if not producto:
+            logger.error("Sincronización de catálogo pendiente: producto no encontrado en Supabase")
+            return {"estado": "pendiente"}
+        p = producto[0]
+        categoria_rel = p.get("inv_categorias")
+        payload = {
+            "id": str(p["id"]),
+            "vendedor_id": str(p["vendedor_id"]),
+            "sku": p["sku"],
+            "nombre": p["nombre"],
+            "precio": float(p["precio"]),
+            "stock": int(p["stock"]),
+            "categoria": categoria_rel.get("nombre") if isinstance(categoria_rel, dict) else None,
+            "imagen_url": p.get("imagen_url"),
+        }
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            response = await client.post(settings.catalog_sync_url, json=payload)
+            response.raise_for_status()
+        return {"estado": "sincronizado"}
+    except httpx.TimeoutException:
+        logger.warning("Sincronización de catálogo pendiente por timeout (producto_id=%s)", producto_id)
+    except httpx.HTTPStatusError as exc:
+        logger.warning("Sincronización de catálogo pendiente por respuesta HTTP %s (producto_id=%s)",
+                       exc.response.status_code, producto_id)
+    except httpx.RequestError as exc:
+        logger.warning("Sincronización de catálogo pendiente por error de conexión %s (producto_id=%s)",
+                       type(exc).__name__, producto_id)
+    except Exception as exc:
+        logger.warning("Sincronización de catálogo pendiente por error %s (producto_id=%s)",
+                       type(exc).__name__, producto_id)
+    return {"estado": "pendiente"}
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> str:
@@ -181,7 +224,7 @@ def obtener_producto(producto_id: UUID):
 
 
 @app.post("/api/productos", status_code=status.HTTP_201_CREATED)
-def crear_producto(producto: ProductoCreate, vendedor_id: str = Depends(current_user)):
+async def crear_producto(producto: ProductoCreate, vendedor_id: str = Depends(current_user)):
     data = producto.model_dump(mode="json")
     try:
         result = supabase.rpc("inv_crear_producto", {
@@ -195,11 +238,12 @@ def crear_producto(producto: ProductoCreate, vendedor_id: str = Depends(current_
         result = result[0] if result else None
     if not result:
         raise HTTPException(status_code=400, detail="No se pudo crear el producto")
-    return result
+    sync = await sincronizar_catalogo(str(result["id"]), vendedor_id)
+    return {**result, "sincronizacion_catalogo": sync["estado"]}
 
 
 @app.patch("/api/productos/{producto_id}")
-def actualizar_producto(producto_id: UUID, cambios: ProductoUpdate, vendedor_id: str = Depends(current_user)):
+async def actualizar_producto(producto_id: UUID, cambios: ProductoUpdate, vendedor_id: str = Depends(current_user)):
     data = cambios.model_dump(mode="json", exclude_unset=True)
     if "stock" in data:
         raise HTTPException(status_code=422, detail="Usa /api/inventario/productos/{producto_id}/movimientos para cambiar stock")
@@ -207,7 +251,9 @@ def actualizar_producto(producto_id: UUID, cambios: ProductoUpdate, vendedor_id:
     if not actual:
         raise HTTPException(status_code=404, detail="Producto no encontrado para este vendedor")
     result = rows(supabase.table("inv_productos").update(data).eq("id", str(producto_id)).eq("vendedor_id", vendedor_id))
-    return result[0] if result else {"message": "Actualizado"}
+    actualizado = result[0] if result else {"message": "Actualizado", "id": str(producto_id)}
+    sync = await sincronizar_catalogo(str(producto_id), vendedor_id)
+    return {**actualizado, "sincronizacion_catalogo": sync["estado"]}
 
 
 @app.delete("/api/productos/{producto_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -288,7 +334,7 @@ def vaciar_carrito(usuario_id: str = Depends(current_user)):
 
 
 @app.post("/api/inventario/productos/{producto_id}/movimientos")
-def registrar_movimiento(producto_id: UUID, movimiento: MovimientoInventario,
+async def registrar_movimiento(producto_id: UUID, movimiento: MovimientoInventario,
                          vendedor_id: str = Depends(current_user)):
     if movimiento.cantidad == 0 or (movimiento.tipo == "ENTRADA" and movimiento.cantidad < 0):
         raise HTTPException(status_code=422, detail="ENTRADA debe ser positiva; AJUSTE no puede ser cero")
@@ -298,7 +344,11 @@ def registrar_movimiento(producto_id: UUID, movimiento: MovimientoInventario,
             "p_tipo": movimiento.tipo, "p_cantidad": movimiento.cantidad,
             "p_nota": movimiento.nota,
         }).execute()
-        return result.data
+        sync = await sincronizar_catalogo(str(producto_id), vendedor_id)
+        data = result.data
+        if isinstance(data, dict):
+            return {**data, "sincronizacion_catalogo": sync["estado"]}
+        return {"resultado": data, "sincronizacion_catalogo": sync["estado"]}
     except Exception as exc:
         logging.getLogger("uvicorn.error").exception("Error al registrar movimiento de inventario")
         raise HTTPException(status_code=409, detail="No se pudo aplicar el movimiento; verifica stock y reservas") from exc
@@ -324,6 +374,7 @@ def agregar_al_carrito(item: CarritoItem, usuario_id: str = Depends(current_user
     except Exception as exc:
         raise HTTPException(status_code=409, detail="Producto no disponible o stock insuficiente") from exc
 
+
 @app.patch("/api/carrito/items/{producto_id}")
 def cambiar_cantidad(producto_id: UUID, cambio: CambioCantidad, usuario_id: str = Depends(current_user)):
     try:
@@ -333,7 +384,8 @@ def cambiar_cantidad(producto_id: UUID, cambio: CambioCantidad, usuario_id: str 
             "p_cantidad": cambio.cantidad,
         }).execute().data
     except Exception as exc:
-        raise HTTPException(status_code=409, detail="?tem no disponible o cantidad superior al stock") from exc
+        raise HTTPException(status_code=409, detail="Ítem no disponible o cantidad superior al stock") from exc
+
 
 @app.delete("/api/carrito/items/{producto_id}", status_code=status.HTTP_204_NO_CONTENT)
 def quitar_del_carrito(producto_id: UUID, usuario_id: str = Depends(current_user)):
@@ -341,6 +393,7 @@ def quitar_del_carrito(producto_id: UUID, usuario_id: str = Depends(current_user
         "p_usuario_id": usuario_id,
         "p_producto_id": str(producto_id),
     }).execute()
+
 
 @app.post("/api/inventario/reservar")
 def reservar_stock(reserva: Reserva, usuario_id: str = Depends(current_user)):
@@ -356,4 +409,4 @@ def reservar_stock(reserva: Reserva, usuario_id: str = Depends(current_user)):
 
 @app.post("/api/inventario/confirmar/{referencia_id}")
 def confirmar_reserva(referencia_id: str):
-    raise HTTPException(status_code=503, detail="Confirmaci?n deshabilitada: no hay verificador de pago configurado. No se descont? inventario.")
+    raise HTTPException(status_code=503, detail="Confirmación deshabilitada: no hay verificador de pago configurado. No se descontó inventario.")
