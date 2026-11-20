@@ -134,6 +134,10 @@ class Reserva(BaseModel):
     referencia_id: str = Field(min_length=1, max_length=100)
 
 
+class LiberarReserva(BaseModel):
+    motivo: str = Field(default="CANCELACION", pattern="^(PAGO_FALLIDO|CANCELACION|TIMEOUT)$")
+
+
 class MovimientoInventario(BaseModel):
     tipo: str = Field(pattern="^(ENTRADA|AJUSTE)$")
     cantidad: int
@@ -410,3 +414,57 @@ def reservar_stock(reserva: Reserva, usuario_id: str = Depends(current_user)):
 @app.post("/api/inventario/confirmar/{referencia_id}")
 def confirmar_reserva(referencia_id: str):
     raise HTTPException(status_code=503, detail="Confirmación deshabilitada: no hay verificador de pago configurado. No se descontó inventario.")
+
+
+@app.post("/api/inventario/liberar/{referencia_id}")
+def liberar_reserva(referencia_id: str, solicitud: LiberarReserva | None = None):
+    motivo = solicitud.motivo if solicitud else "CANCELACION"
+    ahora = datetime.now(timezone.utc).isoformat()
+    reservas = rows(
+        supabase.table("inv_reservas_stock")
+        .select("id, producto_id, cantidad")
+        .eq("referencia_id", referencia_id)
+        .eq("confirmada", False)
+        .gt("expira_en", ahora)
+    )
+    if not reservas:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No se encontró reserva activa para referencia_id: {referencia_id}",
+        )
+
+    items_liberados = []
+    try:
+        for reserva in reservas:
+            producto_id = str(reserva["producto_id"])
+            cantidad = int(reserva["cantidad"])
+            producto = rows(
+                supabase.table("inv_productos")
+                .select("stock")
+                .eq("id", producto_id)
+            )
+            if not producto:
+                raise RuntimeError(f"Producto no encontrado para reserva {reserva['id']}")
+            stock = int(producto[0]["stock"])
+            rows(supabase.table("inv_movimientos_stock").insert({
+                "producto_id": producto_id,
+                "tipo": "AJUSTE",
+                "cantidad": cantidad,
+                "stock_anterior": stock,
+                "stock_resultante": stock,
+                "referencia_id": referencia_id,
+                "nota": f"LIBERACION_RESERVA: {motivo}",
+            }))
+            items_liberados.append({"producto_id": producto_id, "cantidad_liberada": cantidad})
+
+        supabase.table("inv_reservas_stock").delete().in_("id", [r["id"] for r in reservas]).execute()
+    except Exception as exc:
+        logging.getLogger("uvicorn.error").exception("Error al liberar reserva de inventario")
+        raise HTTPException(status_code=409, detail="No se pudo liberar la reserva") from exc
+
+    return {
+        "success": True,
+        "referencia_id": referencia_id,
+        "motivo": motivo,
+        "items_liberados": items_liberados,
+    }
